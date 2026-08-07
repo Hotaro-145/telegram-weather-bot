@@ -12,5 +12,5 @@ def run():
     app.run(host='0.0.0.0', port=8080)
 
 def Keep_alive():
-    t=Thread(run)
+    t=Thread(target=run)
     t.start()
