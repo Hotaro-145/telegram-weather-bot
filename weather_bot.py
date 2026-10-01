@@ -1,4 +1,5 @@
 import asyncio
+from collections import defaultdict
 from datetime import datetime, timezone, timedelta
 import logging
 import os
@@ -53,6 +54,120 @@ def get_wind_direction(deg: float) -> str:
                   "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"]
     idx = round(deg / 22.5) % 16
     return directions[idx]
+
+
+def get_event_category(main_weather: str, desc: str, weather_id: int):
+    """Categorize weather events into standard types with emoji and priority."""
+    main_lower = main_weather.lower()
+    desc_lower = desc.lower()
+
+    if 200 <= weather_id < 300 or "thunderstorm" in main_lower or "thunderstorm" in desc_lower:
+        return ("Thunderstorm", "⛈️", 1, "a thunderstorm")
+    if 600 <= weather_id < 700 or "snow" in main_lower or "sleet" in desc_lower or "snow" in desc_lower:
+        return ("Snow", "❄️", 2, "snow")
+    if 500 <= weather_id < 600 or "rain" in main_lower or "rain" in desc_lower:
+        return ("Rain", "🌧️", 3, "rain")
+    if 300 <= weather_id < 400 or "drizzle" in main_lower or "drizzle" in desc_lower:
+        return ("Drizzle", "🌦️", 4, "drizzle")
+    if 700 <= weather_id < 800 or any(w in desc_lower for w in ["fog", "mist", "haze", "smoke", "dust", "sand", "ash"]):
+        name = "Fog/Mist" if ("fog" in desc_lower or "mist" in desc_lower) else "Haze/Low Visibility"
+        phrasing = "fog/mist" if ("fog" in desc_lower or "mist" in desc_lower) else "reduced visibility"
+        return (name, "🌫️", 5, phrasing)
+    return None
+
+
+def extract_today_events(current_data: dict, today_items: list, upcoming_items: list, tz: timezone, local_now: datetime):
+    """
+    Extract significant weather events (Rain, Snow, Thunderstorm, Fog, High Winds, etc.)
+    with their occurrence times and details for today.
+    Returns: (summary_inline_str, detailed_bullet_lines)
+    """
+    events_by_type = defaultdict(list)
+
+    # 1. Check current weather
+    cur_weather = current_data.get("weather", [{}])[0]
+    cur_id = cur_weather.get("id", 800)
+    cur_main = cur_weather.get("main", "")
+    cur_desc = cur_weather.get("description", "")
+    cur_cat = get_event_category(cur_main, cur_desc, cur_id)
+    if cur_cat:
+        events_by_type[cur_cat].append(("now", clean_text(cur_desc.capitalize()), None))
+
+    # 2. Check today's forecast intervals (or upcoming if late at night)
+    items_to_check = today_items if today_items else upcoming_items
+    for item_dt, item in items_to_check:
+        t_str = item_dt.strftime("%I:%M %p")
+        if not today_items and item_dt.date() > local_now.date():
+            t_str = item_dt.strftime("%a %I:%M %p")
+
+        item_w = item.get("weather", [{}])[0]
+        w_id = item_w.get("id", 800)
+        w_main = item_w.get("main", "")
+        w_desc = item_w.get("description", "")
+        cat = get_event_category(w_main, w_desc, w_id)
+        pop = int(item.get("pop", 0) * 100) if item.get("pop") is not None else None
+
+        if cat:
+            events_by_type[cat].append((t_str, clean_text(w_desc.capitalize()), pop))
+
+        # Check for high winds (>= 10.8 m/s = strong breeze/gale)
+        wind_speed = item.get("wind", {}).get("speed", 0)
+        wind_gust = item.get("wind", {}).get("gust", 0)
+        if wind_speed >= 10.8 or wind_gust >= 15.0:
+            speed_info = f"{wind_speed} m/s"
+            if wind_gust >= 15.0:
+                speed_info += f", gusts {wind_gust} m/s"
+            wind_cat = ("High Wind", "💨", 6, "strong winds")
+            events_by_type[wind_cat].append((t_str, f"Gusts up to {speed_info}", None))
+
+    if not events_by_type:
+        general_desc = cur_desc.capitalize() if cur_desc else "Clear sky"
+        summary_str = f"Today there is no rain or adverse weather expected (mostly {clean_text(general_desc)})"
+        detailed_lines = [f"• ✨ *No rain or adverse weather expected today* (mostly {clean_text(general_desc)})."]
+        return summary_str, detailed_lines
+
+    sorted_cats = sorted(events_by_type.keys(), key=lambda c: c[2])
+    detailed_lines = []
+    short_summaries = []
+
+    for cat in sorted_cats:
+        cat_name, emoji, _, phrasing = cat
+        occurrences = events_by_type[cat]
+
+        times = []
+        descs_set = set()
+        max_pop = 0
+
+        for t_str, d_str, pop in occurrences:
+            if t_str not in times:
+                times.append(t_str)
+            if d_str and "gust" not in d_str.lower():
+                descs_set.add(d_str)
+            if pop and pop > max_pop:
+                max_pop = pop
+
+        times_str = ", ".join(times)
+        descs_str = f" ({', '.join(sorted(descs_set))})" if descs_set else ""
+
+        if "now" in times:
+            other_times = [t for t in times if t != "now"]
+            if other_times:
+                phrase = f"Today there is {phrasing} happening now, and also at {', '.join(other_times)}{descs_str}"
+            else:
+                phrase = f"Today there is {phrasing} happening right now{descs_str}"
+        else:
+            time_word = "at" if len(times) == 1 else "multiple times at"
+            phrase = f"Today there will be {phrasing} {time_word} {times_str}{descs_str}"
+
+        short_summaries.append(f"{emoji} {phrase}")
+
+        detail_line = f"• {emoji} *{cat_name}:* {phrase}"
+        if max_pop > 0:
+            detail_line += f" — 🌧️ {max_pop}% chance"
+        detailed_lines.append(detail_line)
+
+    summary_str = "; ".join(short_summaries)
+    return summary_str, detailed_lines
 
 
 def format_full_weather_report(current_data: dict, forecast_data: dict = None) -> str:
@@ -130,6 +245,11 @@ def format_full_weather_report(current_data: dict, forecast_data: dict = None) -
     day_min = round(min(all_today_mins), 1)
     day_max = round(max(all_today_maxs), 1)
 
+    # Extract Today's Weather Events (Rain, Storms, Snow, High Winds, Fog, etc.)
+    summary_event_str, detailed_event_lines = extract_today_events(
+        current_data, today_items, upcoming_items, tz, local_now
+    )
+
     lines = [
         f"🌍 *Weather Report for {location_title}*",
         f"📅 *Date:* {date_str}",
@@ -137,6 +257,7 @@ def format_full_weather_report(current_data: dict, forecast_data: dict = None) -
         f"🌡️ *Temperature:* {temp}°C (Feels like {feels_like}°C)",
         f"📊 *Today's Range:* High {day_max}°C / Low {day_min}°C",
         f"{emoji} *Condition:* {condition}",
+        f"📢 *Today's Events:* {summary_event_str}",
         f"💧 *Humidity:* {humidity}%",
         f"🌬️ *Pressure:* {pressure} hPa",
         f"💨 *Wind:* {wind_str}",
@@ -144,6 +265,12 @@ def format_full_weather_report(current_data: dict, forecast_data: dict = None) -
         f"☁️ *Cloud Cover:* {clouds}%",
         f"🌅 *Sunrise:* {sunrise_str}  |  🌇 *Sunset:* {sunset_str}",
     ]
+
+    # Detailed Events Section
+    lines.append("\n━━━━━━━━━━━━━━━━━━━━")
+    lines.append("📢 *Today's Expected Events & Alerts:*")
+    for ev_line in detailed_event_lines:
+        lines.append(ev_line)
 
     # Forecast intervals section
     if today_items:
@@ -214,25 +341,46 @@ async def fetch_weather(city: str) -> str:
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # If the user passed a city argument to /start (e.g. /start Tokyo)
+    if context.args:
+        await weather(update, context)
+        return
+
     txt = (
-        "☀️ *Hey there! I'm your local Weather Assistant!* 🌧️\n\n"
-        "Need the complete weather report and today's forecast for any city?\n\n"
-        "Just drop `/weather <city>` in the chat below, and I'll fetch the full report for the present date—including temperature, highs & lows, humidity, wind, sunrise/sunset, and today's timeline!\n\n"
-        "Example: `/weather Tokyo` ⬇️\n"
-        "💡 *Tip: Check spelling if a city isn't recognized.*"
+        "☀️ *Welcome to your Weather Assistant!* 🌧️\n\n"
+        "I provide the **complete daily weather report** and **today's forecast** for any location worldwide for the present date!\n\n"
+        "✨ *Features in the daily report:*\n"
+        "• 📅 *Present Date & Local Time:* Accurately calculated for the city's timezone\n"
+        "• 🌡️ *Temperature:* Current temp & Feels-like temp\n"
+        "• 📊 *Today's Range:* Daily High & Low temperatures\n"
+        "• 📢 *Today's Weather Events:* Live alerts for rain, thunderstorms, snow, fog, high winds with exact times & multiple occurrences\n"
+        "• ☁️ *Live Condition:* With day/night responsive emojis\n"
+        "• 💧 *Atmospheric Metrics:* Humidity, Pressure, Visibility & Cloud cover\n"
+        "• 💨 *Wind Speed & Direction:* With compass bearings (e.g. NE, SSW)\n"
+        "• 🌅 *Sun Cycle:* Local Sunrise & Sunset times\n"
+        "• ⏳ *Today's Timeline:* 3-hour forecast intervals with rain probabilities\n\n"
+        "🚀 *How to use:*\n"
+        "• `/weather <city>` — e.g. `/weather Tokyo`\n"
+        "• `/today <city>` — e.g. `/today London`\n"
+        "• `/start <city>` — e.g. `/start New York`\n"
+        "• Or simply send the city name directly in the chat!\n\n"
+        "Go ahead and type `/weather <your_city>` now! ⬇️"
     )
     await update.message.reply_text(txt, parse_mode="Markdown")
 
 
 async def weather(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
+    if context.args:
+        city = " ".join(context.args)
+    elif update.message and update.message.text and not update.message.text.startswith("/"):
+        city = update.message.text.strip()
+    else:
         await update.message.reply_text(
             "Please provide a city name! Example: `/weather Tokyo`",
             parse_mode="Markdown"
         )
         return
 
-    city = " ".join(context.args)
     report = await fetch_weather(city)
     await update.message.reply_text(report, parse_mode="Markdown")
 
@@ -245,9 +393,11 @@ if __name__ == '__main__':
     start_handler = CommandHandler('start', start)
     weather_handler = CommandHandler('weather', weather)
     today_handler = CommandHandler('today', weather)
+    message_handler = MessageHandler(filters.TEXT & ~filters.COMMAND, weather)
 
     application.add_handler(start_handler)
     application.add_handler(weather_handler)
     application.add_handler(today_handler)
+    application.add_handler(message_handler)
 
     application.run_polling()
